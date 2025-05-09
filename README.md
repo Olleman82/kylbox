@@ -2,6 +2,15 @@
 
 Ett Python-program för att styra Vevor kylbox via Bluetooth.
 
+## Systemberoenden
+
+Innan du installerar Python-paketen, installera dessa systempaket:
+
+```bash
+sudo apt-get update
+sudo apt-get install python3-dbus python3-bluez bluetooth bluez-tools
+```
+
 ## Funktioner
 
 - Läsa av aktuell temperatur
@@ -19,9 +28,9 @@ source venv/bin/activate  # Linux/Mac
 venv\Scripts\activate  # Windows
 ```
 
-2. Installera beroenden:
+2. Installera Python-beroenden:
 ```bash
-pip install bleak
+pip install -r requirements.txt
 ```
 
 ## Användning
