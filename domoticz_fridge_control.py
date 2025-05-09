@@ -15,6 +15,7 @@ DOMOTICZ_URL = "http://192.168.1.123:8080"
 DOMOTICZ_FRIDGE_TEMP_IDX = "62"
 DOMOTICZ_FRIDGE_SETPOINT_IDX = "61"
 DOMOTICZ_POLLING_INTERVAL = 10                # Sekunder mellan varje avläsning från Domoticz
+FRIDGE_POLLING_INTERVAL = 60                  # Sekunder mellan varje fråga till kylboxen
 
 # Globala variabler för att hålla reda på tillstånd
 aiohttp_session = None
@@ -248,6 +249,21 @@ async def poll_domoticz_for_setpoint_changes(client):
             #     print(f"Domoticz: Börvärde ({new_target_temp_from_domoticz}°C) oförändrat jämfört med känt ({current_known_setpoint}°C).")
 
 
+# Ny funktion: Poll kylbox för temperatur var minut
+async def poll_fridge_for_temperature(client):
+    print("Startar kylbox polling för temperatur...")
+    while True:
+        await asyncio.sleep(FRIDGE_POLLING_INTERVAL)
+        if not client or not client.is_connected:
+            continue
+        query_command = create_packet(bytes([0x01]))
+        try:
+            await client.write_gatt_char(WRITE_CHAR, query_command)
+            print("Kylbox polling: skickade temperaturförfrågan")
+        except Exception as e:
+            print(f"Kylbox polling: fel vid fråga om temperatur: {e}")
+
+
 async def main():
     global aiohttp_session, current_known_setpoint
     
@@ -265,6 +281,7 @@ async def main():
         sys.exit(1)
 
     polling_task = None
+    fridge_polling_task = None  # Ny polling-task för kylbox
     try:
         await client.start_notify(NOTIFY_CHAR, notification_handler)
         
@@ -292,6 +309,7 @@ async def main():
             # current_known_setpoint = 4 
 
         polling_task = asyncio.create_task(poll_domoticz_for_setpoint_changes(client))
+        fridge_polling_task = asyncio.create_task(poll_fridge_for_temperature(client))
         print("Huvudloop aktiv. Tryck Ctrl+C för att avsluta.")
         
         # Håll huvudtråden levande
@@ -315,6 +333,15 @@ async def main():
                 print("Domoticz polling-task avbruten.")
             except Exception as e_pt:
                  print(f"Fel vid avslut av polling_task: {e_pt}")
+        if fridge_polling_task and not fridge_polling_task.done():
+            print("Avbryter kylbox polling-task...")
+            fridge_polling_task.cancel()
+            try:
+                await fridge_polling_task
+            except asyncio.CancelledError:
+                print("Kylbox polling-task avbruten.")
+            except Exception as e_fp:
+                print(f"Fel vid avslut av kylbox polling-task: {e_fp}")
         
         if client and client.is_connected:
             print("Kopplar från kylboxen...")
