@@ -14,6 +14,7 @@ NOTIFY_CHAR = "00001236-0000-1000-8000-00805f9b34fb"
 DOMOTICZ_URL = "http://192.168.1.123:8080"
 DOMOTICZ_FRIDGE_TEMP_IDX = "62"
 DOMOTICZ_FRIDGE_SETPOINT_IDX = "61"
+DOMOTICZ_FRIDGE_ECO_IDX = "63"  # Ny IDX för ekoläge
 DOMOTICZ_POLLING_INTERVAL = 10                # Sekunder mellan varje avläsning från Domoticz
 
 # Globala variabler för att hålla reda på tillstånd
@@ -23,6 +24,9 @@ aiohttp_session = None
 current_known_setpoint = None
 last_reported_fridge_temp = None
 last_reported_fridge_target = None
+current_known_eco = None  # Håller senaste kända ekoläge
+# Spara senaste status från kylboxen
+last_fridge_status = None
 
 
 def calculate_checksum(data: bytes) -> int:
@@ -133,9 +137,60 @@ async def get_domoticz_setpoint(idx: str) -> float | None:
         print(f"Domoticz: Fel vid avkodning/tolkning av JSON ({e}) från Domoticz för enhet {idx}. Svar: {html_response[:200]}")
         return None
 
+async def get_domoticz_eco(idx: str) -> int | None:
+    """Hämtar ekoläge från en Domoticz-enhet (0=Max, 1=Eco)."""
+    global aiohttp_session
+    if not idx or idx == "IDX_ECO":
+        print(f"Domoticz: Ogiltigt IDX ('{idx}') för eco. Uppdatera konfigurationen.")
+        return None
+    if not aiohttp_session:
+        print("Domoticz: Aiohttp session är inte initialiserad.")
+        return None
+    url = f"{DOMOTICZ_URL}/json.htm?type=devices&rid={idx}"
+    try:
+        async with aiohttp_session.get(url) as response:
+            if response.status == 200:
+                data = await response.json()
+                if data.get("status") == "OK" and data.get("result"):
+                    device_info = data["result"][0]
+                    eco_str = device_info.get("Data")
+                    if eco_str is None:
+                        eco_str = device_info.get("svalue1")
+                    if eco_str is not None:
+                        eco_str = eco_str.strip().lower()
+                        if eco_str in ["eco", "eko"]:
+                            return 1
+                        if eco_str == "max":
+                            return 0
+                        if eco_str == "1":
+                            return 1
+                        if eco_str == "0":
+                            return 0
+                        try:
+                            return int(float(eco_str.split(" ")[0]))
+                        except ValueError:
+                            print(f"Domoticz: Kunde inte tolka eco '{eco_str}' som ett tal eller känt läge för IDX {idx}.")
+                            return None
+                    else:
+                        print(f"Domoticz: Inget 'Data' eller 'svalue1' fält hittades för IDX {idx}. Enhetsinfo: {device_info}")
+                        return None
+                else:
+                    print(f"Domoticz: Fel vid hämtning av enhet {idx}: {data.get('status')}")
+                    return None
+            else:
+                print(f"Domoticz: HTTP-fel {response.status} vid hämtning av enhet {idx}.")
+                return None
+    except aiohttp.ClientError as e:
+        print(f"Domoticz: Kunde inte ansluta för att hämta enhet {idx}: {e}")
+        return None
+    except (json.JSONDecodeError, IndexError) as e:
+        html_response = await response.text()
+        print(f"Domoticz: Fel vid avkodning/tolkning av JSON ({e}) från Domoticz för enhet {idx}. Svar: {html_response[:200]}")
+        return None
+
 # --- Kylbox Kommunikation ---
 def notification_handler(_, data):
-    global current_known_setpoint, last_reported_fridge_temp, last_reported_fridge_target
+    global current_known_setpoint, last_reported_fridge_temp, last_reported_fridge_target, last_fridge_status
     cmd, payload = parse_frame(data)
 
     if cmd == 0x01:  # query-svar
@@ -146,6 +201,8 @@ def notification_handler(_, data):
             bat_vol = f"{payload[16]}.{payload[17]}"
 
             print(f"Kylbox: Aktuell temp: {actual_temp}°C, Måltemp: {target_temp}°C, Batteri: {bat_percent}% ({bat_vol}V)")
+            # Spara hela payloaden som senaste status
+            last_fridge_status = payload[:]
             # print(f"Debug - payload (Query): {[hex(x) for x in payload]}")
 
             if DOMOTICZ_FRIDGE_TEMP_IDX != "IDX_TEMP" and last_reported_fridge_temp != actual_temp:
@@ -221,35 +278,79 @@ async def set_temperature(client, temp: int):
     except BleakError as e:
         print(f"Kylbox: Fel vid sändning av temperaturkommando: {e}")
 
+async def set_eco_mode(client, eco: int):
+    global current_known_eco, last_fridge_status, current_known_setpoint
+    if not client or not client.is_connected:
+        print("Kylbox: Klienten är inte ansluten. Kan inte sätta ekoläge.")
+        return
 
-async def poll_domoticz_for_setpoint_changes(client):
-    global current_known_setpoint
-    print("Startar Domoticz polling för ändringar i börvärde...")
+    # Kontrollera om det verkligen är en förändring
+    if current_known_eco == eco:
+        print(f"Kylbox: Ekoläge är redan satt till {eco}, ingen ändring behövs.")
+        return
+
+    # Hämta senaste status från kylboxen om vi inte har någon
+    if last_fridge_status is None or len(last_fridge_status) < 15:
+        print("Kylbox: Hämtar aktuell status innan ekoläge ändras...")
+        # Skicka query och vänta på svar
+        query_command_payload = bytes([0x01])
+        query_to_send = create_packet(query_command_payload)
+        await client.write_gatt_char(WRITE_CHAR, query_to_send)
+        await asyncio.sleep(2)
+        if last_fridge_status is None or len(last_fridge_status) < 15:
+            print("Kylbox: Kunde inte läsa aktuell status, avbryter ekolägesändring.")
+            return
+
+    # Bygg nytt paket baserat på senaste status
+    data = bytearray(last_fridge_status)
+    data[2] = eco  # runMode
+    # Behåll current_known_setpoint om det finns
+    if current_known_setpoint is not None:
+        data[4] = struct.pack('b', current_known_setpoint)[0]  # Sätt måltemperatur
+    
+    # Skapa Set-paket
+    set_packet = create_packet(bytes([0x02]) + data)
+    print(f"Kylbox: Skickar kommando för att sätta ekoläge till {eco} med temp {current_known_setpoint}°C: {[hex(x) for x in set_packet]}")
+    try:
+        await client.write_gatt_char(WRITE_CHAR, set_packet)
+        print(f"Kylbox: Kommando för att sätta ekoläge till {eco} skickat.")
+        current_known_eco = eco
+        await asyncio.sleep(1)
+        print("Kylbox: Verifierar ekoläge genom ny query...")
+        query_command_payload = bytes([0x01])
+        query_to_send = create_packet(query_command_payload)
+        await client.write_gatt_char(WRITE_CHAR, query_to_send)
+        await asyncio.sleep(2)
+    except BleakError as e:
+        print(f"Kylbox: Fel vid sändning av eco-kommando: {e}")
+
+async def poll_domoticz_for_changes(client):
+    global current_known_setpoint, current_known_eco
+    print("Startar gemensam Domoticz polling för börvärde och ekoläge...")
     while True:
         await asyncio.sleep(DOMOTICZ_POLLING_INTERVAL)
         if not client or not client.is_connected:
-            # print("Domoticz Polling: Kylbox-klient inte ansluten, pausar tillfälligt.")
-            continue # Fortsätt loopa, klienten kan återansluta
-
-        if DOMOTICZ_FRIDGE_SETPOINT_IDX == "IDX_SETPOINT":
-            # print("Domoticz Polling: IDX för setpoint är inte konfigurerad.")
             continue
 
+        # Hämta båda värdena parallellt
+        setpoint_task = asyncio.create_task(get_domoticz_setpoint(DOMOTICZ_FRIDGE_SETPOINT_IDX))
+        eco_task = asyncio.create_task(get_domoticz_eco(DOMOTICZ_FRIDGE_ECO_IDX))
+        domoticz_sp_float, domoticz_eco = await asyncio.gather(setpoint_task, eco_task)
 
-        domoticz_sp_float = await get_domoticz_setpoint(DOMOTICZ_FRIDGE_SETPOINT_IDX)
-
+        # Hantera setpoint endast om det är en faktisk förändring
         if domoticz_sp_float is not None:
             new_target_temp_from_domoticz = int(round(domoticz_sp_float))
-
             if current_known_setpoint is None or new_target_temp_from_domoticz != current_known_setpoint:
                 print(f"Domoticz: Nytt börvärde upptäckt: {new_target_temp_from_domoticz}°C (tidigare känt: {current_known_setpoint}°C). Sätter ny temp på kylbox.")
                 await set_temperature(client, new_target_temp_from_domoticz)
-            # else:
-            #     print(f"Domoticz: Börvärde ({new_target_temp_from_domoticz}°C) oförändrat jämfört med känt ({current_known_setpoint}°C).")
 
+        # Hantera eco endast om det är en faktisk förändring
+        if domoticz_eco is not None and domoticz_eco != current_known_eco:
+            print(f"Domoticz: Nytt ekoläge upptäckt: {domoticz_eco} (tidigare känt: {current_known_eco}). Sätter nytt ekoläge på kylbox.")
+            await set_eco_mode(client, domoticz_eco)
 
 async def main():
-    global aiohttp_session, current_known_setpoint
+    global aiohttp_session, current_known_setpoint, current_known_eco
     
     parser = argparse.ArgumentParser(description='Styr kylboxen och synkronisera med Domoticz')
     parser.add_argument('--address', type=str, default="07:4D:FB:A7:C4:5E", help='Bluetooth-adress till kylboxen (standard: 07:4D:FB:A7:C4:5E)')
@@ -291,7 +392,7 @@ async def main():
             # Fallback, om du vill ha ett defaultvärde om inget kan läsas
             # current_known_setpoint = 4 
 
-        polling_task = asyncio.create_task(poll_domoticz_for_setpoint_changes(client))
+        polling_task = asyncio.create_task(poll_domoticz_for_changes(client))
         print("Huvudloop aktiv. Tryck Ctrl+C för att avsluta.")
         
         # Håll huvudtråden levande
@@ -310,11 +411,11 @@ async def main():
             print("Avbryter Domoticz polling-task...")
             polling_task.cancel()
             try:
-                await polling_task 
+                await polling_task
             except asyncio.CancelledError:
                 print("Domoticz polling-task avbruten.")
             except Exception as e_pt:
-                 print(f"Fel vid avslut av polling_task: {e_pt}")
+                print(f"Fel vid avslut av polling_task: {e_pt}")
         
         if client and client.is_connected:
             print("Kopplar från kylboxen...")
